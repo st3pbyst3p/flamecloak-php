@@ -1,0 +1,31 @@
+{
+    "name": "flamecloak/flamecloak",
+    "description": "Flamecloak for PHP: ask before your code acts. No dependencies beyond curl.",
+    "type": "library",
+    "license": "Apache-2.0",
+    "homepage": "https://github.com/st3pbyst3p/flamecloak-php",
+    "keywords": [
+        "flamecloak",
+        "authorization",
+        "approval",
+        "passkey",
+        "ai-agents"
+    ],
+    "support": {
+        "docs": "https://github.com/st3pbyst3p/flamecloak-php/blob/main/GUIDE.md",
+        "source": "https://github.com/st3pbyst3p/flamecloak-php"
+    },
+    "require": {
+        "php": ">=8.1",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Flamecloak\\": "src/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
