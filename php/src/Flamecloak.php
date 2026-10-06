@@ -32,7 +32,7 @@ namespace Flamecloak;
  */
 final class Flamecloak
 {
-    public const VERSION = '0.2.0';
+    public const VERSION = '0.3.0';
 
     private const KEY = '/^fc_[0-9a-z]{8}_[0-9a-z]{32}$/';
     private const NO_KEY = 'no key was given: the App key screen in the Flamecloak dashboard issues one, and FLAMECLOAK_KEY is where the snippets read it from';
@@ -43,6 +43,11 @@ final class Flamecloak
     private const LONG_POLL_SECONDS = 25;
     private const UNREACHABLE = 'unreachable';
     private const KEPT = 'the gateway could not be reached; the decision is kept there, so ask again with wait() or collect()';
+    /** call()'s words for the same two outages. The same in every SDK. */
+    private const ENDPOINT_UNREACHABLE = 'your endpoint could not be reached';
+    private const CALL_KEPT = 'the gateway could not be reached; the decision is kept there, so call again with its id';
+    /** How often a held call's result is asked for once it is approved: the gateway makes the call on a timer. */
+    private const EXECUTION_POLL_SECONDS = 5.0;
 
     /** Where this client's calls go. */
     public readonly string $baseUrl;
@@ -50,17 +55,19 @@ final class Flamecloak
     private readonly float $timeout;
     /** @var callable(): float */
     private $clock;
+    /** @var callable(float): void */
+    private $sleep;
     private readonly ?string $planFile;
     /** @var array{refuse_unknown: bool, refresh_seconds: float, modes: array<string, string>}|null */
     private ?array $plan = null;
     private ?float $planAskedAt = null;
 
     /**
-     * @param array{base_url?: string, timeout?: float|int, plan_cache?: string|false, clock?: callable(): float} $options
+     * @param array{base_url?: string, timeout?: float|int, plan_cache?: string|false, clock?: callable(): float, sleep?: callable(float): void} $options
      *   `base_url` only for a key that carries no address, or a self-hosted gateway.
      *   `timeout` is one request's, in seconds; a long-poll gets it on top of its wait.
      *   `plan_cache` is a directory for the plan, or false for memory only.
-     *   `clock` is a clock in seconds, for tests.
+     *   `clock` is a clock in seconds, and `sleep` the wait between call()'s attempts, both for tests.
      */
     public function __construct(string|false|null $key, array $options = [])
     {
@@ -70,6 +77,9 @@ final class Flamecloak
         [$this->baseUrl, $this->credential] = self::readKey($key, $options['base_url'] ?? null);
         $this->timeout = (float) ($options['timeout'] ?? 10.0);
         $this->clock = $options['clock'] ?? static fn (): float => \microtime(true);
+        $this->sleep = $options['sleep'] ?? static function (float $seconds): void {
+            \usleep((int) \round($seconds * 1_000_000));
+        };
         $cache = $options['plan_cache'] ?? \sys_get_temp_dir();
         $this->planFile = $cache === false ? null : \rtrim((string) $cache, '/\\') . \DIRECTORY_SEPARATOR
             . 'flamecloak-plan-' . \substr($this->credential, 3, 8) . '-' . \substr(\hash('sha256', $this->baseUrl), 0, 8) . '.json';
@@ -325,12 +335,209 @@ final class Flamecloak
         return $this->send('POST', '/v1/actions/decisions/' . \rawurlencode($decisionId) . '/done', $body) !== null;
     }
 
+    /**
+     * Make a call to your own endpoint through the gateway in front of it, and
+     * wait for a person when it is gated.
+     *
+     * A 403 `pending` is sent again - the same method, address, headers and
+     * body, byte for byte - with `x-flamecloak-decision`, on the gateway's
+     * `retry-after`, until it is answered. A 202 means the gateway is holding
+     * the call to make it itself: this waits on the decision with your key,
+     * then on the gateway's call, and says what that came to. `decisionId`
+     * carries on with a decision a `pending` answer left you with. Never throws
+     * for an answer; throws for a request it cannot make.
+     *
+     * @param array<string, string> $headers
+     */
+    public function call(
+        string $url,
+        string $method = 'GET',
+        array $headers = [],
+        ?string $body = null,
+        int|float|null $maxWaitSeconds = null,
+        ?string $decisionId = null,
+    ): CallResult {
+        $verb = \strtoupper($method);
+        if (\preg_match('#^https?://[^/\s]+#i', $url) !== 1) {
+            throw new FlamecloakException('url is the http or https address of your endpoint');
+        }
+        if ($body !== null && \in_array($verb, ['GET', 'HEAD'], true)) {
+            throw new FlamecloakException('a GET or HEAD carries no body');
+        }
+        $deadline = $maxWaitSeconds === null ? null : ($this->clock)() + $maxWaitSeconds;
+
+        $decision = null;
+        if ($decisionId !== null) {
+            // Which of the two waits this was: the gateway knows, and says so.
+            $kept = $this->send('GET', '/v1/decisions/' . \rawurlencode($decisionId) . '/execution', null);
+            if ($kept === null) {
+                return new CallResult('unavailable', decisionId: $decisionId, detail: self::CALL_KEPT);
+            }
+            if (($kept['deferred'] ?? null) === true || \is_string($kept['outcome'] ?? null)) {
+                return $this->held($decisionId, $deadline);
+            }
+            $decision = $decisionId;
+        }
+
+        while (true) {
+            $answer = $this->endpoint($verb, $url, $headers, $body, $decision);
+            if ($answer === null) {
+                return new CallResult('unavailable', decisionId: $decision, detail: self::ENDPOINT_UNREACHABLE);
+            }
+            [$status, $read, $text] = $answer;
+            $reason = $read['x-flamecloak-reason'] ?? null;
+            $found = $read['x-flamecloak-decision'] ?? $decision;
+            // Forwarded: the gateway says how it was let through, or says nothing at all.
+            if (isset($read['x-flamecloak-authorization']) || $reason === null) {
+                return new CallResult('answered', $status, $read, $text, $found);
+            }
+            if ($status === 202 && isset($read['x-flamecloak-deferred']) && $found !== null) {
+                return $this->held($found, $deadline);
+            }
+            $parsed = \json_decode($text, true);
+            $said = \is_array($parsed) && \is_string($parsed['error'] ?? null) ? $parsed['error'] : null;
+            if ($reason !== 'pending' || $status !== 403 || $found === null) {
+                return new CallResult('refused', $status, $read, $text, $found, false, $reason, $said);
+            }
+            $decision = $found;
+            $pause = self::retryAfter($read['retry-after'] ?? null);
+            if ($deadline !== null) {
+                $left = $deadline - ($this->clock)();
+                if ($left <= 0) {
+                    return new CallResult('pending', $status, $read, $text, $found, false, $reason, $said);
+                }
+                $pause = \min($pause, $left);
+            }
+            ($this->sleep)($pause);
+        }
+    }
+
     public function __debugInfo(): array
     {
         return ['baseUrl' => $this->baseUrl];
     }
 
     // ── inside ──────────────────────────────────────────────────────────────
+
+    /** `retry-after` is the gateway's; never sooner than one second, never later than a minute. */
+    private static function retryAfter(?string $value): float
+    {
+        $seconds = $value !== null && \preg_match('/^\d+$/', \trim($value)) === 1 ? (float) \trim($value) : 5.0;
+        return \min(\max($seconds, 1.0), 60.0);
+    }
+
+    /** A held call: the decision, then the gateway's own call. */
+    private function held(string $decisionId, ?float $deadline): CallResult
+    {
+        $quoted = \rawurlencode($decisionId);
+        $kept = new CallResult('unavailable', decisionId: $decisionId, held: true, detail: self::CALL_KEPT);
+        $waiting = new CallResult('pending', decisionId: $decisionId, held: true, reason: 'pending');
+        while (true) {
+            $seconds = self::LONG_POLL_SECONDS;
+            if ($deadline !== null) {
+                $left = $deadline - ($this->clock)();
+                if ($left <= 0) {
+                    return $waiting;
+                }
+                $seconds = (int) \min(self::LONG_POLL_SECONDS, \ceil($left));
+            }
+            $answer = $this->send('GET', "/v1/decisions/$quoted/long-poll?wait=$seconds", null, $seconds + $this->timeout);
+            if ($answer === null || !\is_string($answer['state'] ?? null)) {
+                return $kept;
+            }
+            if ($answer['state'] === 'pending') {
+                continue;
+            }
+            if ($answer['state'] !== 'approved') {
+                $why = \is_string($answer['reason'] ?? null) ? $answer['reason'] : null;
+                return new CallResult('refused', decisionId: $decisionId, held: true, reason: $answer['state'], detail: $why);
+            }
+            break;
+        }
+        while (true) {
+            $answer = $this->send('GET', "/v1/decisions/$quoted/execution", null);
+            if ($answer === null) {
+                return $kept;
+            }
+            $outcome = $answer['outcome'] ?? null;
+            if (\is_string($outcome)) {
+                $status = $answer['status'] ?? null;
+                return new CallResult(
+                    $outcome === 'answered' ? 'executed' : ($outcome === 'attempted' ? 'attempted' : 'refused'),
+                    \is_int($status) ? $status : null,
+                    decisionId: $decisionId,
+                    held: true,
+                    reason: $outcome === 'refused' ? 'not_made' : null,
+                    detail: \is_string($answer['message'] ?? null) ? $answer['message'] : null,
+                );
+            }
+            $pause = self::EXECUTION_POLL_SECONDS;
+            if ($deadline !== null) {
+                $left = $deadline - ($this->clock)();
+                if ($left <= 0) {
+                    return $waiting;
+                }
+                $pause = \min($pause, $left);
+            }
+            ($this->sleep)($pause);
+        }
+    }
+
+    /**
+     * One attempt at your endpoint. Never carries the key: the server in front of it adds its own.
+     *
+     * @param array<string, string> $given
+     * @return array{0: int, 1: array<string, string>, 2: string}|null
+     */
+    private function endpoint(string $method, string $url, array $given, ?string $body, ?string $decision): ?array
+    {
+        $headers = ['expect:'];
+        foreach ($given as $name => $value) {
+            $headers[] = "$name: $value";
+        }
+        if ($decision !== null) {
+            $headers[] = 'x-flamecloak-decision: ' . $decision;
+        }
+        $handle = \curl_init($url);
+        if ($handle === false) {
+            return null;
+        }
+        $read = [];
+        $options = [
+            \CURLOPT_CUSTOMREQUEST => $method,
+            \CURLOPT_RETURNTRANSFER => true,
+            \CURLOPT_FOLLOWLOCATION => true,
+            \CURLOPT_MAXREDIRS => 20,
+            \CURLOPT_TIMEOUT_MS => (int) \round($this->timeout * 1000),
+            \CURLOPT_CONNECTTIMEOUT_MS => (int) \round($this->timeout * 1000),
+            \CURLOPT_PROTOCOLS => \CURLPROTO_HTTP | \CURLPROTO_HTTPS,
+            \CURLOPT_REDIR_PROTOCOLS => \CURLPROTO_HTTP | \CURLPROTO_HTTPS,
+            \CURLOPT_HTTPHEADER => $headers,
+            // The headers of the LAST answer: a redirect starts a new set.
+            \CURLOPT_HEADERFUNCTION => static function ($curl, string $line) use (&$read): int {
+                if (\str_starts_with($line, 'HTTP/')) {
+                    $read = [];
+                } elseif (($colon = \strpos($line, ':')) !== false) {
+                    $read[\strtolower(\trim(\substr($line, 0, $colon)))] = \trim(\substr($line, $colon + 1));
+                }
+                return \strlen($line);
+            },
+        ];
+        if ($method === 'HEAD') {
+            $options[\CURLOPT_NOBODY] = true;
+        }
+        if ($body !== null) {
+            $options[\CURLOPT_POSTFIELDS] = $body;
+        }
+        \curl_setopt_array($handle, $options);
+        $raw = \curl_exec($handle);
+        $status = (int) \curl_getinfo($handle, \CURLINFO_RESPONSE_CODE);
+        \curl_close($handle);
+        if (!\is_string($raw) || $status === 0) {
+            return null;
+        }
+        return [$status, $read, $raw];
+    }
 
     /** The plan, read at most once per refresh interval - also after a failure. */
     private function refreshPlan(): void

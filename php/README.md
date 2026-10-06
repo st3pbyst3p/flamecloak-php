@@ -98,6 +98,17 @@ Errors are `Flamecloak\FlamecloakException`, with `httpStatus` set to the
 gateway's HTTP status, or `null` for a key that is not one. A refused notice
 is its subclass `FlamecloakWebhookException`, with `reason`.
 
+When Flamecloak sits in front of an endpoint, `call()` makes the call and
+waits: a 403 `pending` is sent again byte for byte with the decision, and a
+202 (held) is waited on until the gateway has made the call itself.
+
+```php
+$result = $flamecloak->call('https://api.example.com/api/orders/1');
+// $result->outcome: answered, executed, attempted, refused, pending or unavailable
+```
+
+See [calls through your gateway](https://github.com/st3pbyst3p/flamecloak-php/blob/main/GUIDE.md#calls-through-your-gateway).
+
 What every status means, what throws, and what to check before shipping: the
 [developer guide](https://github.com/st3pbyst3p/flamecloak-php/blob/main/GUIDE.md#every-answer).
 

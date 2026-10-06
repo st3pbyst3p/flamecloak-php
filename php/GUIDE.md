@@ -140,6 +140,7 @@ without an address, takes the address as an option.
 | `wait(decisionId)` | The waiting, for a decision you kept earlier. |
 | `collect(decisionId)` | Spends an approval: `allowed: true` once, and never again. Does not wait. |
 | `done(decisionId, status)` | Optional: reports what happened (`succeeded` or `failed`). Once per decision. |
+| `call(url, …)` | A call to your own endpoint through the gateway in front of it, waiting for a person when it is gated. See [Calls through your gateway](#calls-through-your-gateway). |
 
 Every answer is a decision: `allowed`, `status`, `decisionId`, `reason`,
 `detail`, and `token` (a signed approval, when the gateway signs).
@@ -194,6 +195,69 @@ SDK's page has the handler that resumes the job.
 - **A managed gateway only posts to a public https address.** A self-hosted
   one can reach a private address when its environment says
   `WEBHOOK_PRIVATE_ADDRESSES=allow`.
+
+## Calls through your gateway
+
+When Flamecloak sits in front of an endpoint - your server sends those paths to
+it - your code does not call `authorize()`: it calls the endpoint, and a gated
+call is answered by the gateway instead of your application. `call()` makes
+that call and does the waiting:
+
+```js
+const result = await flamecloak.call({
+  url: 'https://api.example.com/api/payouts',
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ amount: 1250, to: 'acct-1' }),
+});
+if (result.outcome === 'answered') console.log(result.status, result.body);
+```
+
+```python
+result = flamecloak.call(
+    "https://api.example.com/api/payouts",
+    method="POST",
+    headers={"content-type": "application/json"},
+    body='{"amount":1250,"to":"acct-1"}',
+)
+```
+
+```php
+$result = $flamecloak->call(
+    'https://api.example.com/api/payouts',
+    method: 'POST',
+    headers: ['content-type' => 'application/json'],
+    body: '{"amount":1250,"to":"acct-1"}',
+);
+```
+
+- **A 403 `pending` is sent again, byte for byte.** The same method, address,
+  headers and body, with `x-flamecloak-decision`, on the gateway's
+  `retry-after`, until a person answers. An approval covers one exact call: the
+  body is read once and sent unchanged every time, so do not rebuild it between
+  attempts yourself.
+- **A 202 means the gateway is holding the call** to make it itself, once, when
+  a person approves. `call()` then waits on the decision with your key, waits
+  for the gateway's call, and says what your endpoint answered it. The
+  response body is not kept by the gateway, so `body` is empty; ask your own
+  application for what it did.
+- **Your key never goes to your endpoint.** The server in front of it adds its
+  own; your key is sent only to the gateway, to wait on a held call.
+- `maxWaitSeconds` (`max_wait_seconds` in Python) bounds the wait; then the
+  outcome is `pending` with `decisionId`, and calling again with that
+  `decisionId` carries on instead of asking a person again.
+
+| `outcome` | Meaning |
+|---|---|
+| `answered` | Your endpoint answered: `status`, `headers` and `body` are its answer, whatever the status. |
+| `executed` | The gateway held the call, a person approved it, and the gateway made it: `status` is what your endpoint answered. |
+| `attempted` | The gateway sent it and no answer came. It may have run, and it is never sent again: check your own application before doing anything. |
+| `refused` | The gateway refused it and waiting will not change that: `reason` says why (`denied`, `expired`, …) and `detail` in the gateway's words. |
+| `pending` | Still waiting when your longest wait ran out. Call again with `decisionId`. |
+| `unavailable` | Your endpoint or the gateway could not be reached. A held call's decision is kept; call again with its id. |
+
+`call()` throws only for a request it cannot make: an address that is not one,
+or a body on a GET.
 
 ## Before you ship
 
