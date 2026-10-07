@@ -99,7 +99,8 @@ gateway's HTTP status, or `null` for a key that is not one. A refused notice
 is its subclass `FlamecloakWebhookException`, with `reason`.
 
 When Flamecloak sits in front of an endpoint, `call()` makes the call and
-waits: a 403 `pending` is sent again byte for byte with the decision, and a
+waits: a 423 `pending` (403 from a gateway older than October 2026) is sent
+again byte for byte with the decision, and a
 202 (held) is waited on until the gateway has made the call itself.
 
 ```php

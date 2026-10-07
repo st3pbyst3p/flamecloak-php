@@ -32,7 +32,15 @@ namespace Flamecloak;
  */
 final class Flamecloak
 {
-    public const VERSION = '0.3.0';
+    public const VERSION = '0.3.1';
+
+    /**
+     * The statuses a `pending` refusal comes with. 423 since October 2026: a
+     * web application reads 401 and 403 as "not logged in", so the gateway
+     * stopped answering them for its own refusals. 403 is kept so this SDK still
+     * waits on a gateway that has not been updated yet.
+     */
+    private const PENDING_STATUSES = [423, 403];
 
     private const KEY = '/^fc_[0-9a-z]{8}_[0-9a-z]{32}$/';
     private const NO_KEY = 'no key was given: the App key screen in the Flamecloak dashboard issues one, and FLAMECLOAK_KEY is where the snippets read it from';
@@ -339,7 +347,7 @@ final class Flamecloak
      * Make a call to your own endpoint through the gateway in front of it, and
      * wait for a person when it is gated.
      *
-     * A 403 `pending` is sent again - the same method, address, headers and
+     * A 423 `pending` is sent again - the same method, address, headers and
      * body, byte for byte - with `x-flamecloak-decision`, on the gateway's
      * `retry-after`, until it is answered. A 202 means the gateway is holding
      * the call to make it itself: this waits on the decision with your key,
@@ -396,7 +404,7 @@ final class Flamecloak
             }
             $parsed = \json_decode($text, true);
             $said = \is_array($parsed) && \is_string($parsed['error'] ?? null) ? $parsed['error'] : null;
-            if ($reason !== 'pending' || $status !== 403 || $found === null) {
+            if ($reason !== 'pending' || !\in_array($status, self::PENDING_STATUSES, true) || $found === null) {
                 return new CallResult('refused', $status, $read, $text, $found, false, $reason, $said);
             }
             $decision = $found;

@@ -231,7 +231,8 @@ $result = $flamecloak->call(
 );
 ```
 
-- **A 403 `pending` is sent again, byte for byte.** The same method, address,
+- **A 423 `pending` is sent again, byte for byte.** (A gateway older than
+  October 2026 answers 403; it is waited on the same way.) The same method, address,
   headers and body, with `x-flamecloak-decision`, on the gateway's
   `retry-after`, until a person answers. An approval covers one exact call: the
   body is read once and sent unchanged every time, so do not rebuild it between
